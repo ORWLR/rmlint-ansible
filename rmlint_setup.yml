@@ -66,9 +66,24 @@
         state: directory
         mode: "0755"
 
+    - name: Check ZFS pool health before scan
+      ansible.builtin.command:
+        cmd: zpool status -x
+      register: zpool_prescan
+      changed_when: false
+
+    - name: Fail if pool is not healthy
+      ansible.builtin.fail:
+        msg: |
+          ZFS pool problem detected — aborting scan to avoid reading corrupt data.
+          {{ zpool_prescan.stdout }}
+      when: "'all pools are healthy' not in zpool_prescan.stdout"
+
     - name: Run rmlint scan with xattr caching
       ansible.builtin.command:
         cmd: >
+          nice -n 10
+          ionice -c 3
           rmlint
           -T duplicates
           --size {{ rmlint_min_size }}
@@ -76,6 +91,8 @@
           -o json:{{ rmlint_output_dir }}/results.json
           -o sh:{{ rmlint_output_dir }}/rmlint.sh
           {{ rmlint_keep_path }} // {{ rmlint_clean_path }}
+      # nice -n 10: lower CPU scheduling priority so the host stays responsive
+      # ionice -c 3: idle I/O class — rmlint yields disk to any other I/O
       # -T duplicates: scan only for duplicate files (not empty dirs, broken symlinks, etc.)
       # //: files left of // are originals (kept), files right are removal candidates
       # --xattr-read/write: cache checksums as file xattrs for fast repeated runs

@@ -13,9 +13,21 @@
     scripts_dir: /opt/near_dupes
     phash_threshold: 5
     text_sim_threshold: 0.85
-    exiftool_parallel: "{{ ansible_processor_vcpus }}"
+    # sentence-transformers loads a ~90 MB model plus all document embeddings into RAM.
+    # 2048 MB is a safe minimum; raise if scanning tens of thousands of documents.
+    scan_min_free_mb_ml: 2048
 
   tasks:
+
+    - name: Assert sufficient free RAM for ML workload
+      ansible.builtin.assert:
+        that:
+          - ansible_memfree_mb >= scan_min_free_mb_ml
+        fail_msg: >
+          Only {{ ansible_memfree_mb }} MB free RAM (minimum: {{ scan_min_free_mb_ml }} MB).
+          sentence-transformers requires significant RAM to load embeddings.
+          Run zfs_tune.yml to cap the ZFS ARC and free memory, or lower scan_min_free_mb_ml.
+        success_msg: "{{ ansible_memfree_mb }} MB free RAM — OK for ML scanning."
 
     - name: Ensure system packages are installed
       ansible.builtin.package:
@@ -69,13 +81,13 @@
     - name: Extract EXIF metadata from images
       ansible.builtin.shell:
         cmd: >
-          find {{ scan_paths | map('quote') | join(' ') }}
-          -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png'
-          -o -iname '*.heic' -o -iname '*.tiff' \)
-          -print0 |
-          xargs -0 -P{{ exiftool_parallel }}
-          exiftool -json -DateTimeOriginal -CreateDate -ImageSize
-          -Model -FileSize -FileName > {{ output_dir | quote }}/exif_metadata.json
+          exiftool -json -r
+          -ext jpg -ext jpeg -ext png -ext heic -ext tiff
+          -DateTimeOriginal -CreateDate -ImageSize -Model -FileSize -FileName
+          {{ scan_paths | map('quote') | join(' ') }}
+          > {{ output_dir | quote }}/exif_metadata.json
+      # exiftool -r recurses directories internally; avoids xargs -P interleaving
+      # that would produce corrupted JSON when parallel workers share stdout.
       changed_when: false
       failed_when: false
 
