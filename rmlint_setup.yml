@@ -1,0 +1,94 @@
+---
+- name: Configure ZFS xattr support and run rmlint deduplication scan
+  hosts: target
+  become: true
+
+  vars:
+    zfs_dataset: pool/data
+    zfs_mountpoint: /pool/data
+    rmlint_keep_path: /pool/keep
+    rmlint_clean_path: /pool/clean
+    rmlint_output_dir: /var/lib/rmlint
+    rmlint_min_size: "1M"
+
+  tasks:
+
+    - name: Ensure required packages are installed
+      ansible.builtin.package:
+        name:
+          - rmlint
+          - attr
+          - jq
+        state: present
+
+    - name: Ensure ZFS dataset exists with xattr=sa
+      community.general.zfs:
+        name: "{{ zfs_dataset }}"
+        state: present
+        extra_zfs_properties:
+          xattr: sa
+
+    - name: Create xattr test file
+      ansible.builtin.file:
+        path: "{{ zfs_mountpoint }}/.xattr_test"
+        state: touch
+        mode: "0644"
+      changed_when: false
+
+    - name: Write test xattr
+      ansible.builtin.command:
+        cmd: setfattr -n user.ansible_test -v "ok" {{ zfs_mountpoint }}/.xattr_test
+      changed_when: false
+
+    - name: Read test xattr
+      ansible.builtin.command:
+        cmd: getfattr -n user.ansible_test --only-values {{ zfs_mountpoint }}/.xattr_test
+      register: xattr_check
+      changed_when: false
+
+    - name: Fail if xattr not functional
+      ansible.builtin.fail:
+        msg: >
+          Extended attributes are not working on {{ zfs_mountpoint }}.
+          Got '{{ xattr_check.stdout }}' instead of 'ok'.
+          Check ZFS version (needs 0.7.0+) with: zfs version
+      when: xattr_check.stdout != "ok"
+
+    - name: Clean up xattr test file
+      ansible.builtin.file:
+        path: "{{ zfs_mountpoint }}/.xattr_test"
+        state: absent
+      changed_when: false
+
+    - name: Ensure rmlint output directory exists
+      ansible.builtin.file:
+        path: "{{ rmlint_output_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Run rmlint scan with xattr caching
+      ansible.builtin.command:
+        cmd: >
+          rmlint
+          -T duplicates
+          --size {{ rmlint_min_size }}
+          --xattr-read --xattr-write --write-unfinished
+          -o json:{{ rmlint_output_dir }}/results.json
+          -o sh:{{ rmlint_output_dir }}/rmlint.sh
+          {{ rmlint_keep_path }} // {{ rmlint_clean_path }}
+      # -T duplicates: scan only for duplicate files (not empty dirs, broken symlinks, etc.)
+      # //: files left of // are originals (kept), files right are removal candidates
+      # --xattr-read/write: cache checksums as file xattrs for fast repeated runs
+      # --write-unfinished: persist xattr cache even if the run is interrupted
+      register: rmlint_result
+      changed_when: false
+
+    - name: Report scan summary
+      ansible.builtin.debug:
+        msg: |
+          rmlint completed. Results written to:
+            JSON:   {{ rmlint_output_dir }}/results.json
+            Script: {{ rmlint_output_dir }}/rmlint.sh
+
+          Review before executing:
+            jq '.[:-1] | sort_by(-.size) | .[:20]' {{ rmlint_output_dir }}/results.json

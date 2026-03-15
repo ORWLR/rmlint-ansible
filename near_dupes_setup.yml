@@ -1,0 +1,118 @@
+---
+- name: Deploy and run near-duplicate detection pipeline
+  hosts: target
+  become: true
+
+  vars:
+    zfs_mountpoint: /pool/data
+    scan_paths:
+      - /pool/data/photos
+      - /pool/data/documents
+    output_dir: /var/lib/rmlint/near_dupes
+    venv_path: /opt/near_dupes_venv
+    scripts_dir: /opt/near_dupes
+    phash_threshold: 5
+    text_sim_threshold: 0.85
+    exiftool_parallel: "{{ ansible_processor_vcpus }}"
+
+  tasks:
+
+    - name: Ensure system packages are installed
+      ansible.builtin.package:
+        name:
+          - python3
+          - python3-venv
+          - python3-pip
+          - libimage-exiftool-perl
+          - poppler-utils
+          - jq
+        state: present
+
+    - name: Ensure virtualenv exists
+      ansible.builtin.command:
+        cmd: python3 -m venv {{ venv_path }}
+        creates: "{{ venv_path }}/bin/activate"
+
+    - name: Install Python dependencies in venv
+      ansible.builtin.pip:
+        name:
+          - imagehash
+          - Pillow
+          - sentence-transformers
+        state: present
+        virtualenv: "{{ venv_path }}"
+
+    - name: Ensure scripts directory exists
+      ansible.builtin.file:
+        path: "{{ scripts_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Deploy image near-duplicate detector
+      ansible.builtin.copy:
+        src: scripts/image_near_dupes.py
+        dest: "{{ scripts_dir }}/image_near_dupes.py"
+        mode: "0755"
+
+    - name: Deploy document near-duplicate detector
+      ansible.builtin.copy:
+        src: scripts/doc_near_dupes.py
+        dest: "{{ scripts_dir }}/doc_near_dupes.py"
+        mode: "0755"
+
+    - name: Ensure output directory exists
+      ansible.builtin.file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Extract EXIF metadata from images
+      ansible.builtin.shell:
+        cmd: >
+          find {{ scan_paths | map('quote') | join(' ') }}
+          -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png'
+          -o -iname '*.heic' -o -iname '*.tiff' \)
+          -print0 |
+          xargs -0 -P{{ exiftool_parallel }}
+          exiftool -json -DateTimeOriginal -CreateDate -ImageSize
+          -Model -FileSize -FileName > {{ output_dir | quote }}/exif_metadata.json
+      changed_when: false
+      failed_when: false
+
+    - name: Run image near-duplicate detection
+      ansible.builtin.command:
+        argv: >-
+          {{ [venv_path + '/bin/python', scripts_dir + '/image_near_dupes.py',
+              phash_threshold | string,
+              output_dir + '/image_near_dupes.json'] + scan_paths }}
+      changed_when: false
+      register: image_result
+
+    - name: Run document near-duplicate detection
+      ansible.builtin.command:
+        argv: >-
+          {{ [venv_path + '/bin/python', scripts_dir + '/doc_near_dupes.py',
+              text_sim_threshold | string,
+              output_dir + '/doc_near_dupes.json'] + scan_paths }}
+      changed_when: false
+      register: doc_result
+
+    - name: Report results
+      ansible.builtin.debug:
+        msg: |
+          Near-duplicate scan complete.
+
+          {{ image_result.stdout }}
+          {{ doc_result.stdout }}
+
+          Results:
+            EXIF metadata:  {{ output_dir }}/exif_metadata.json
+            Image clusters: {{ output_dir }}/image_near_dupes.json
+            Doc clusters:   {{ output_dir }}/doc_near_dupes.json
+
+          Review with:
+            jq '.[] | .files' {{ output_dir }}/image_near_dupes.json
+            jq '.[] | .files' {{ output_dir }}/doc_near_dupes.json
+
+          Nothing has been deleted. These are reports only.
+
