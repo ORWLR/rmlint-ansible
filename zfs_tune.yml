@@ -1,0 +1,190 @@
+---
+- name: Tune ZFS, verify pool and disk health, install monitoring tools
+  hosts: target
+  become: true
+
+  vars:
+    zfs_dataset: pool/data
+
+    # Dataset properties — tuned for large-file scan workloads.
+    # recordsize: 128K suits mixed photo/document archives; use 1M for video-only pools.
+    zfs_recordsize: "128K"
+
+    # ZFS ARC memory cap in bytes.
+    # Default: 50% of total RAM — keeps the ARC from crowding out rmlint and the
+    # sentence-transformers model (~2 GB) when both run on the same host.
+    zfs_arc_max_bytes: "{{ (ansible_memtotal_mb * 1024 * 1024 * 0.5) | int }}"
+    zfs_arc_min_bytes: "{{ (ansible_memtotal_mb * 1024 * 1024 * 0.1) | int }}"
+
+    # sysctl tuning for large sequential scan workloads.
+    vm_swappiness: 10           # default 60 — reduces eager swapping during scan
+    vm_vfs_cache_pressure: 50   # default 100 — reduces eviction of dentry/inode cache
+
+    # Minimum free RAM (MB) required before scanning is permitted.
+    # rmlint alone needs ~512 MB; sentence-transformers needs ~2048 MB.
+    scan_min_free_mb: 512
+
+  tasks:
+
+    # ── 1. Monitoring and health tools ──────────────────────────────────────
+
+    - name: Install monitoring and disk health tools
+      ansible.builtin.package:
+        name:
+          - sysstat        # iostat / sar / pidstat — per-process I/O accounting
+          - iotop          # real-time per-process disk I/O monitor
+          - smartmontools  # S.M.A.R.T. disk health checks
+          - htop           # interactive process monitor
+        state: present
+
+    - name: Enable sysstat periodic collection
+      ansible.builtin.service:
+        name: sysstat
+        state: started
+        enabled: true
+      # sysstat's cron jobs record CPU/IO/memory samples every 10 min via sa1,
+      # and produce daily reports via sa2. Use 'sar -d' to review disk I/O history.
+
+    # ── 2. ZFS pool health gate ──────────────────────────────────────────────
+
+    - name: Check ZFS pool health
+      ansible.builtin.command:
+        cmd: zpool status -x
+      register: zpool_health
+      changed_when: false
+
+    - name: Fail if any pool is not healthy
+      ansible.builtin.fail:
+        msg: |
+          ZFS pool problem detected — do not scan until resolved:
+          {{ zpool_health.stdout }}
+          Run 'zpool status' for details.
+      when: "'all pools are healthy' not in zpool_health.stdout"
+
+    - name: Report pool status
+      ansible.builtin.debug:
+        msg: "{{ zpool_health.stdout }}"
+
+    # ── 3. S.M.A.R.T. disk health check ─────────────────────────────────────
+
+    - name: Discover physical disks for SMART check
+      ansible.builtin.command:
+        cmd: smartctl --scan
+      register: smartctl_scan
+      changed_when: false
+      failed_when: false
+      # Returns non-zero on VMs or when no SMART devices are found — that is OK.
+
+    - name: Check SMART health on each disk
+      ansible.builtin.command:
+        cmd: smartctl -H {{ item.split()[0] }}
+      register: smart_health
+      changed_when: false
+      failed_when: false
+      loop: "{{ smartctl_scan.stdout_lines | default([]) }}"
+      when: smartctl_scan.rc == 0
+
+    - name: Report SMART health per disk
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item.split()[0] }}:
+          {{ item.stdout_lines
+             | select('search', 'result|Result|SMART overall|test result')
+             | list | join(' ') | default('no summary line') }}
+      loop: "{{ smart_health.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.split()[0] }}"
+      when:
+        - smartctl_scan.rc == 0
+        - item.rc == 0
+
+    - name: Fail on SMART health failure
+      ansible.builtin.fail:
+        msg: |
+          S.M.A.R.T. health check FAILED on {{ item.item.split()[0] }}.
+          Do not scan a failing drive — risk of data loss.
+          Run 'smartctl -a {{ item.item.split()[0] }}' for the full report.
+      loop: "{{ smart_health.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.split()[0] }}"
+      when:
+        - item.rc == 0
+        - "'FAILED' in item.stdout"
+
+    # ── 4. ZFS dataset tuning ────────────────────────────────────────────────
+
+    - name: Tune ZFS dataset properties for scan workload
+      community.general.zfs:
+        name: "{{ zfs_dataset }}"
+        state: present
+        extra_zfs_properties:
+          atime: "off"           # skip access-time writes during traversal
+          compression: lz4       # compress new data; lz4 has negligible CPU cost
+          xattr: sa              # store xattrs in inode, not a hidden directory
+          recordsize: "{{ zfs_recordsize }}"
+
+    # ── 5. ZFS ARC memory cap ────────────────────────────────────────────────
+
+    - name: Write ZFS ARC memory limits to modprobe config
+      ansible.builtin.copy:
+        dest: /etc/modprobe.d/zfs.conf
+        content: |
+          # ZFS ARC memory tuning — managed by rmlint-ansible
+          # Capped at ~50% of RAM so rmlint and sentence-transformers have headroom.
+          # Adjust zfs_arc_max_bytes in zfs_tune.yml vars to suit your workload.
+          options zfs zfs_arc_max={{ zfs_arc_max_bytes }}
+          options zfs zfs_arc_min={{ zfs_arc_min_bytes }}
+        mode: "0644"
+
+    - name: Apply ZFS ARC limits immediately (no reboot required)
+      ansible.builtin.shell:
+        cmd: |
+          echo "{{ zfs_arc_max_bytes }}" > /sys/module/zfs/parameters/zfs_arc_max
+          echo "{{ zfs_arc_min_bytes }}" > /sys/module/zfs/parameters/zfs_arc_min
+      changed_when: false
+      failed_when: false
+      # /sys/module/zfs/parameters/ is live — writes take effect immediately.
+      # failed_when: false because the path may not exist if ZFS is not yet loaded.
+
+    # ── 6. VM sysctl tuning ──────────────────────────────────────────────────
+
+    - name: Write sysctl config for scan workloads
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-rmlint-scan.conf
+        content: |
+          # VM tuning for rmlint scanning — managed by rmlint-ansible
+          # Reduce swap eagerness; large sequential scans are swap-unfriendly.
+          vm.swappiness={{ vm_swappiness }}
+          # Preserve dentry/inode cache under memory pressure.
+          vm.vfs_cache_pressure={{ vm_vfs_cache_pressure }}
+        mode: "0644"
+
+    - name: Apply sysctl settings
+      ansible.builtin.command:
+        cmd: sysctl --system
+      changed_when: false
+
+    # ── 7. Pre-scan memory gate ──────────────────────────────────────────────
+
+    - name: Assert sufficient free RAM before scanning
+      ansible.builtin.assert:
+        that:
+          - ansible_memfree_mb >= scan_min_free_mb
+        fail_msg: >
+          Only {{ ansible_memfree_mb }} MB free RAM (minimum: {{ scan_min_free_mb }} MB).
+          Reduce zfs_arc_max_bytes in vars or stop memory-hungry services before scanning.
+        success_msg: "{{ ansible_memfree_mb }} MB free RAM — sufficient to proceed."
+
+    # ── 8. Report current ARC state ─────────────────────────────────────────
+
+    - name: Read current ZFS ARC stats
+      ansible.builtin.command:
+        cmd: cat /proc/spl/kstat/zfs/arcstats
+      register: arcstats
+      changed_when: false
+      failed_when: false
+
+    - name: Report ARC size and hit rate
+      ansible.builtin.debug:
+        msg: "{{ arcstats.stdout_lines | select('match', '^(size|c_max|c_min|hits|misses) ') | list }}"
+      when: arcstats.rc == 0
